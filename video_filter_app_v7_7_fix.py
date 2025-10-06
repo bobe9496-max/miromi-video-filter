@@ -49,8 +49,8 @@ def load_cube_lut(path: str) -> np.ndarray:
         lut = lut / 255.0
     return np.clip(lut, 0.0, 1.0).astype(np.float32)
 
-# ---------- LUT apply (기본 RGB, BGR 옵션) ----------
-def apply_lut(frame_bgr: np.ndarray, lut: np.ndarray, order: str = "RGB") -> np.ndarray:
+# ---------- LUT apply (기본 BGR, RGB 옵션) ----------
+def apply_lut(frame_bgr: np.ndarray, lut: np.ndarray, order: str = "BGR") -> np.ndarray:
     size = lut.shape[0]
     bgr = frame_bgr.astype(np.float32) / 255.0
     b, g, r = cv2.split(bgr)
@@ -58,10 +58,10 @@ def apply_lut(frame_bgr: np.ndarray, lut: np.ndarray, order: str = "RGB") -> np.
     ig = np.clip((g * (size - 1)).astype(np.int32), 0, size - 1)
     ir = np.clip((r * (size - 1)).astype(np.int32), 0, size - 1)
 
-    if order == "BGR":
-        mapped_rgb = lut[ib, ig, ir]      # v1과 동일(B,G,R 순으로 인덱싱)
-    else:  # "RGB" (여러 상용 LUT이 이쪽에 맞음)
-        mapped_rgb = lut[ir, ig, ib]
+    if order == "RGB":
+        mapped_rgb = lut[ir, ig, ib]      # RGB LUT
+    else:  # "BGR" (v1 기본 동작)
+        mapped_rgb = lut[ib, ig, ir]
 
     mapped_u8 = (np.clip(mapped_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
     return cv2.cvtColor(mapped_u8, cv2.COLOR_RGB2BGR)
@@ -109,7 +109,7 @@ def apply_film_grain(frame_bgr: np.ndarray, intensity: float) -> np.ndarray:
 def apply_dream_blur(frame_bgr: np.ndarray, amount: int) -> np.ndarray:
     if amount <= 0:
         return frame_bgr
-    k = amount * 2 + 1   # 홀수 커널
+    k = amount * 2 + 1
     blurred = cv2.GaussianBlur(frame_bgr, (k, k), 0)
     alpha = min(0.8, 0.06 * amount)
     out = cv2.addWeighted(frame_bgr, 1.0 - alpha, blurred, alpha, 0.0)
@@ -154,8 +154,7 @@ colA, colB = st.columns(2)
 with colA:
     lut_name = st.selectbox("LUT 프리셋", ["None"] + lut_list, index=0)
 with colB:
-    # 네 환경에 맞춰 기본값을 RGB로
-    lut_order = st.radio("LUT 색상 순서", ["RGB (기본)", "BGR"], horizontal=True, index=0)
+    lut_order = st.radio("LUT 색상 순서", ["BGR (기본)", "RGB"], horizontal=True, index=0)
 
 st.subheader("📼 오버레이 & 노이즈")
 col1, col2 = st.columns(2)
@@ -209,10 +208,10 @@ if run and video is not None:
         h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
 
+        # 빠른 렌더: FPS cap + 프레임 스킵(grab)
         target_fps = min(15.0, fps) if fast_mode else fps
-        frame_skip = 1
-        if fast_mode and fps > 15:
-            frame_skip = int(round(fps / 15.0))  # 대략 15fps 샘플링
+        frame_skip = int(round(max(1.0, fps / 15.0))) if (fast_mode and fps > 15) else 1
+        effective_total = (total // frame_skip) if (total > 0) else 0
 
         out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
         out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), target_fps, (w, h))
@@ -229,39 +228,38 @@ if run and video is not None:
         if noise_name != "None":
             noise_cap = cv2.VideoCapture(os.path.join(NOISE_DIR, noise_name))
 
-        prog = st.progress(0)
-        done = 0
-        idx = 0
+        prog = st.progress(0.0)
+        processed = 0
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
+            # LUT
             if lut is not None:
                 frame = apply_lut(frame, lut, order=("RGB" if "RGB" in lut_order else "BGR"))
 
+            # 효과
             if grain_intensity > 0:
                 frame = apply_film_grain(frame, grain_intensity)
-
             if blur_step > 0:
                 frame = apply_dream_blur(frame, blur_step)
-
             if overlay_name != "None":
                 frame = apply_overlay(frame, os.path.join(OVERLAY_DIR, overlay_name), overlay_alpha)
-
             if noise_cap is not None and noise_strength > 0:
                 frame = apply_moving_noise(frame, noise_cap, noise_strength)
 
             out.write(frame)
-            done += 1
+            processed += 1
 
-            if fast_mode and frame_skip > 1:
-                idx += 1
-                cap.set(cv2.CAP_PROP_POS_FRAMES, cap.get(cv2.CAP_PROP_POS_FRAMES) + (frame_skip - 1))
+            # 프레임 스킵은 grab()로 건너뜀 → 진행바 오차 최소화
+            if frame_skip > 1:
+                for _ in range(frame_skip - 1):
+                    cap.grab()
 
-            if total > 0:
-                prog.progress(min(1.0, done / max(total, 1)))
+            if effective_total > 0:
+                prog.progress(min(1.0, processed / effective_total))
 
         cap.release()
         out.release()
