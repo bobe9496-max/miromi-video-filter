@@ -1,343 +1,222 @@
-# video_filter_app_v7_7_fix.py
-# Miromi Retro Filter – Developed by THE PLATFORM COMPANY
+@ -1,106 +1,106 @@
+# ======================================
+# Miromi Retro Filter  (Streamlit)
+# Developed by THE PLATFORM COMPANY
+# ======================================
 import streamlit as st
 import cv2
 import numpy as np
-import tempfile
 import os
-from pathlib import Path
+import tempfile
 
-# --------------------------
-# Page / theme (UI 고정)
-# --------------------------
-st.set_page_config(page_title="Miromi Retro Filter", page_icon="🎞", layout="centered")
-st.markdown("""
-<style>
-/* 본문 폭 고정 */
-.block-container {max-width: 900px !important;}
-/* 위·아래 여백 살짝 축소 */
-.main {padding-top: 1.2rem; padding-bottom: 2rem;}
-/* 버튼 라운드+굵기 */
-.stButton>button {border-radius: 10px; font-weight: 600;}
-</style>
-""", unsafe_allow_html=True)
-
+st.set_page_config(page_title="Miromi Retro Filter", layout="centered")
 st.title("🎞 Miromi Retro Filter")
 st.caption("Developed by THE PLATFORM COMPANY")
 
-# --------------------------
-# Paths
-# --------------------------
-ROOT = Path(os.getcwd())
-LUT_DIR     = ROOT / "filters"
-OVERLAY_DIR = ROOT / "overlays"
-NOISE_DIR   = ROOT / "noise_videos"
-for p in [LUT_DIR, OVERLAY_DIR, NOISE_DIR]:
-    p.mkdir(parents=True, exist_ok=True)
+# --- Project folders ---
+ROOT = os.getcwd()
+LUT_DIR      = os.path.join(ROOT, "filters")
+OVERLAY_DIR  = os.path.join(ROOT, "overlays")
+NOISE_DIR    = os.path.join(ROOT, "noise_videos")
+for d in [LUT_DIR, OVERLAY_DIR, NOISE_DIR]:
+    os.makedirs(d, exist_ok=True)
 
-# --------------------------
-# Utils
-# --------------------------
-def list_files(folder: Path, exts):
-    if not folder.exists():
-        return []
-    exts = tuple(e.lower() for e in exts)
-    return sorted([f.name for f in folder.iterdir() if f.is_file() and f.suffix.lower() in exts], key=str.lower)
-
-def load_overlay_image(name):
-    path = str(OVERLAY_DIR / name)
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)  # PNG alpha 지원
-    return img
-
-def first_frame_of_video(path: str):
-    cap = cv2.VideoCapture(path)
-    ok, frame = cap.read()
-    cap.release()
-    if not ok or frame is None:
-        return None
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-# ---- LUT: 확실한 파서 (LUT_3D_SIZE 기반)
-def load_cube_lut(path: str):
-    size = None
-    data = []
+# ---------- LUT loader (LUT_3D_SIZE 기반, v1 호환) ----------
+def load_cube_lut(path: str) -> np.ndarray:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            # 헤더
-            if parts[0].upper() == "LUT_3D_SIZE":
-                size = int(parts[-1])
-                continue
-            # 데이터
-            if len(parts) == 3:
-                try:
-                    r, g, b = map(float, parts)
-                    data.append([r, g, b])
-                except:
-                    pass
+        lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+
+    size = None
+    for ln in lines:
+        if ln.upper().startswith("LUT_3D_SIZE"):
+            size = int(ln.split()[-1])
+            break
     if size is None:
-        # fallback: cube가 정방일 때 루트로 유추
-        n = int(round(len(data) ** (1/3)))
-        size = max(2, n)
-    arr = np.array(data, dtype=np.float32)
-    arr = arr.reshape((size, size, size, 3))           # [R, G, B] 순
-    arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-    return arr  # RGB 결과표
+        raise ValueError("LUT_3D_SIZE not found in: " + path)
 
-# ---- LUT 적용: 기본은 BGR(권장). 필요 시 RGB 토글
-def apply_lut_bgr(frame_bgr: np.ndarray, lut_rgb: np.ndarray, mode: str = "BGR"):
-    """
-    frame_bgr : 원본 BGR(0..255, uint8)
-    lut_rgb   : LUT[R,G,B] -> (R,G,B)  uint8
-    mode      : "BGR"(권장) | "RGB"
-    """
-    size = lut_rgb.shape[0]
-    if mode == "BGR":
-        # BGR 프레임에서 R,G,B 채널 인덱스 생성 (LUT은 RGB 인덱싱)
-        r = frame_bgr[..., 2]
-        g = frame_bgr[..., 1]
-        b = frame_bgr[..., 0]
-        idx_r = ((r.astype(np.float32) / 255.0) * (size - 1)).astype(np.int32)
-        idx_g = ((g.astype(np.float32) / 255.0) * (size - 1)).astype(np.int32)
-        idx_b = ((b.astype(np.float32) / 255.0) * (size - 1)).astype(np.int32)
-        out_rgb = lut_rgb[idx_r, idx_g, idx_b]
-        out_bgr = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
-        return out_bgr
+    triplets = []
+    for ln in lines:
+        parts = ln.split()
+        if len(parts) == 3:
+            try:
+                triplets.append([float(parts[0]), float(parts[1]), float(parts[2])])
+            except Exception:
+                pass
+    data = np.asarray(triplets, dtype=np.float32)
+    if data.size != size * size * size * 3:
+        raise ValueError(f"Cube data size mismatch. expected {size**3} rows, got {data.shape[0]}")
+    lut = data.reshape(size, size, size, 3)
+    if lut.max() > 1.001:  # 0..255 형태일 때 정규화
+        lut = lut / 255.0
+    return np.clip(lut, 0.0, 1.0).astype(np.float32)
+
+# ---------- LUT apply (기본 BGR, RGB 옵션) ----------
+def apply_lut(frame_bgr: np.ndarray, lut: np.ndarray, order: str = "BGR") -> np.ndarray:
+    size = lut.shape[0]
+    bgr = frame_bgr.astype(np.float32) / 255.0
+    b, g, r = cv2.split(bgr)
+    ib = np.clip((b * (size - 1)).astype(np.int32), 0, size - 1)
+    ig = np.clip((g * (size - 1)).astype(np.int32), 0, size - 1)
+    ir = np.clip((r * (size - 1)).astype(np.int32), 0, size - 1)
+
+    if order == "RGB":
+        mapped_rgb = lut[ir, ig, ib]      # 진짜 RGB LUT일 때
+    else:  # "BGR" (v1 기본 동작)
+        mapped_rgb = lut[ib, ig, ir]
+
+    mapped_u8 = (np.clip(mapped_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    return cv2.cvtColor(mapped_u8, cv2.COLOR_RGB2BGR)
+
+# ---------- Static overlay (PNG/JPG, 알파 지원) ----------
+def apply_overlay(frame_bgr: np.ndarray, overlay_path: str, alpha: float) -> np.ndarray:
+    ov = cv2.imread(overlay_path, cv2.IMREAD_UNCHANGED)
+    if ov is None:
+        return frame_bgr
+    ov = cv2.resize(ov, (frame_bgr.shape[1], frame_bgr.shape[0]))
+    out = frame_bgr.astype(np.float32)
+
+    if ov.shape[2] == 4:
+        rgb = ov[:, :, :3].astype(np.float32)
+        a   = (ov[:, :, 3:4].astype(np.float32) / 255.0) * alpha
+        out = (1.0 - a) * out + a * rgb
     else:
-        # 프레임을 RGB로 간주하여 곧바로 인덱싱 (특수 LUT 대응)
-        r = frame_bgr[..., 0]
-        g = frame_bgr[..., 1]
-        b = frame_bgr[..., 2]
-        idx_r = ((r.astype(np.float32) / 255.0) * (size - 1)).astype(np.int32)
-        idx_g = ((g.astype(np.float32) / 255.0) * (size - 1)).astype(np.int32)
-        idx_b = ((b.astype(np.float32) / 255.0) * (size - 1)).astype(np.int32)
-        out_rgb = lut_rgb[idx_r, idx_g, idx_b]
-        return cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
-
-def apply_static_grain(frame_bgr, amount=0.0):
-    if amount <= 0: 
-        return frame_bgr
-    h, w = frame_bgr.shape[:2]
-    noise = np.random.normal(0, 25, (h, w, 3)).astype(np.float32)  # 기본 노이즈
-    out = np.clip(frame_bgr.astype(np.float32) + noise * amount, 0, 255).astype(np.uint8)
-    return out
-
-def apply_dream_blur(frame_bgr, strength=0.0):
-    if strength <= 0:
-        return frame_bgr
-    k = max(1, int(3 + strength * 6))  # 3~9
-    if k % 2 == 0: 
-        k += 1
-    blur = cv2.GaussianBlur(frame_bgr, (k, k), 0)
-    # screen blend: 1 - (1-A)(1-B)
-    A = frame_bgr.astype(np.float32) / 255.0
-    B = blur.astype(np.float32) / 255.0
-    screen = 1.0 - (1.0 - A) * (1.0 - B)
-    out = (A * (1 - 0.35*strength) + screen * (0.35*strength)) * 255.0
+        out = cv2.addWeighted(out, 1.0 - alpha, ov.astype(np.float32), alpha, 0.0)
     return np.clip(out, 0, 255).astype(np.uint8)
 
-def apply_overlay(frame_bgr, overlay, opacity=0.3):
-    if overlay is None:
+# ---------- Moving noise (video) ----------
+def apply_moving_noise(frame_bgr: np.ndarray, noise_cap, strength: float):
+    if noise_cap is None:
+        return frame_bgr
+    ret, nf = noise_cap.read()
+    if not ret:
+        noise_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ret, nf = noise_cap.read()
+        if not ret:
+            return frame_bgr
+    nf = cv2.resize(nf, (frame_bgr.shape[1], frame_bgr.shape[0]))
+    return cv2.addWeighted(frame_bgr, 1.0 - strength, nf, strength, 0.0)
+
+# ---------- Film grain (procedural) ----------
+def apply_film_grain(frame_bgr: np.ndarray, intensity: float) -> np.ndarray:
+    if intensity <= 0:
         return frame_bgr
     h, w = frame_bgr.shape[:2]
-    ov = cv2.resize(overlay, (w, h))
-    if ov.shape[2] == 4:  # RGBA
-        rgb = ov[..., :3]
-        alpha = (ov[..., 3:].astype(np.float32) / 255.0) * opacity
-        base = frame_bgr.astype(np.float32)
-        rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR).astype(np.float32)
-        out = base * (1 - alpha) + rgb_bgr * alpha
-        return np.clip(out, 0, 255).astype(np.uint8)
-    else:
-        # no alpha → 단순 가중합
-        ov_bgr = cv2.cvtColor(ov, cv2.COLOR_RGB2BGR)
-        return cv2.addWeighted(frame_bgr, 1 - opacity, ov_bgr, opacity, 0)
-
-def blend_moving_noise(frame_bgr, noise_frame_bgr, amount=0.25):
-    if noise_frame_bgr is None or amount <= 0:
+    noise = np.random.normal(0, 25 * intensity, (h, w, 1)).astype(np.float32)  # 단일 채널 노이즈
+    noise = np.random.normal(0, 25 * intensity, (h, w, 1)).astype(np.float32)
+    noise = np.repeat(noise, 3, axis=2)
+    out = frame_bgr.astype(np.float32) + noise
+    return np.clip(out, 0, 255).astype(np.uint8)
+@ -111,11 +111,37 @@ def apply_dream_blur(frame_bgr: np.ndarray, amount: int) -> np.ndarray:
         return frame_bgr
-    noise = cv2.resize(noise_frame_bgr, (frame_bgr.shape[1], frame_bgr.shape[0]))
-    # addWeighted로 살짝 얹기
-    return cv2.addWeighted(frame_bgr, 1 - amount, noise, amount, 0)
+    k = amount * 2 + 1   # 홀수 커널
+    blurred = cv2.GaussianBlur(frame_bgr, (k, k), 0)
+    # 소프트 블렌드
+    alpha = min(0.8, 0.06 * amount)
+    out = cv2.addWeighted(frame_bgr, 1.0 - alpha, blurred, alpha, 0.0)
+    return out
 
-# --------------------------
-# Sidebar / Controls
-# --------------------------
-video_file = st.file_uploader("🎥 영상 업로드 (MP4/MOV/AVI · 최대 1GB)", type=["mp4", "mov", "avi"])
+# ---------- Previews (overlay & noise thumbnails) ----------
+@st.cache_data(show_spinner=False)
+def load_overlay_preview(path: str, max_w=480) -> np.ndarray:
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    if img.shape[2] == 4:
+        img = img[:, :, :3]
+    if img.shape[1] > max_w:
+        scale = max_w / img.shape[1]
+        img = cv2.resize(img, (int(img.shape[1] * scale), int(img.shape[0] * scale)))
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-lut_files = list_files(LUT_DIR, [".cube"])
-overlay_files = list_files(OVERLAY_DIR, [".png", ".jpg", ".jpeg"])
-noise_files = list_files(NOISE_DIR, [".mp4", ".mov", ".m4v"])
-
-st.subheader("🎨 LUT & 이펙트")
-col1, col2 = st.columns(2)
-with col1:
-    lut_name = st.selectbox("LUT 프리셋", ["None"] + lut_files, index=0)
-    lut_mode = st.radio("LUT 색상 순서", ["BGR (권장)", "RGB"], horizontal=True, index=0,
-                        help="얼굴이 파랗게 보이면 BGR이 맞지 않는 경우이므로 RGB로 바꿔 확인하세요.")
-with col2:
-    fast_mode = st.checkbox("⚡ 빠른 렌더 (30초 이내)", value=True,
-                            help="FPS를 낮추고 프레임 처리량/해상도를 약간 줄여 렌더 속도를 높입니다. GPU는 사용하지 않습니다(클라우드 제한).")
-
-st.markdown("### 📼 오버레이 & 노이즈")
-ov_col, nz_col = st.columns(2)
-with ov_col:
-    overlay_name = st.selectbox("정지 오버레이 이미지", ["None"] + overlay_files, index=0)
-    overlay_op = st.slider("오버레이 강도", 0, 10, 3)  # 0~10
-    # 선택한 오버레이 썸네일
-    if overlay_name != "None":
-        ov_img = load_overlay_image(overlay_name)
-        if ov_img is not None:
-            st.image(cv2.cvtColor(ov_img[..., :3], cv2.COLOR_BGR2RGB), caption=overlay_name, use_column_width=True)
-
-with nz_col:
-    noise_name = st.selectbox("움직이는 노이즈(비디오)", ["None"] + noise_files, index=0)
-    noise_mix = st.slider("노이즈 강도", 0, 10, 2)
-    # 동영상 첫 프레임 썸네일
-    if noise_name != "None":
-        thumb = first_frame_of_video(str(NOISE_DIR / noise_name))
-        if thumb is not None:
-            st.image(thumb, caption=f"{noise_name} (thumbnail)", use_column_width=True)
-
-st.markdown("### 🎚️ 기본 효과")
-c1, c2 = st.columns(2)
-with c1:
-    grain_amt = st.slider("그레인(정지)", 0, 10, 2)
-with c2:
-    blur_amt = st.slider("드림 블러", 0, 10, 1)
-
-st.divider()
-preview_sec = 3
-cprev, crun = st.columns([1,1])
-btn_preview = cprev.button(f"🎬 {preview_sec}초 미리보기 만들기")
-btn_render  = crun.button("🚀 전체 영상 렌더링")
-
-# --------------------------
-# Core processing
-# --------------------------
-def process_video(src_path: str, out_path: str, full_render: bool):
-    cap = cv2.VideoCapture(src_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-
-    # 빠른 렌더: FPS 낮추고, 약간 스케일 다운
-    if fast_mode:
-        target_fps = min(fps, 18)
-        scale = 0.90
-    else:
-        target_fps = fps
-        scale = 1.0
-
-    out_w, out_h = int(width * scale), int(height * scale)
-    if out_w < 2 or out_h < 2:
-        out_w, out_h = width, height
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    writer = cv2.VideoWriter(out_path, fourcc, target_fps, (out_w, out_h))
-
-    # 미리 LUT/오버레이/노이즈 준비
-    lut = None
-    if lut_name != "None":
-        lut = load_cube_lut(str(LUT_DIR / lut_name))
-
-    ov_img = None
-    if overlay_name != "None":
-        ov_img = load_overlay_image(overlay_name)
-
-    noise_cap = None
-    if noise_name != "None":
-        noise_cap = cv2.VideoCapture(str(NOISE_DIR / noise_name))
-
-    max_frames = total
-    if not full_render:
-        # 미리보기는 N초까지만
-        max_frames = int(min(total, preview_sec * fps))
-
-    prog = st.progress(0.0)
-    done = 0
-
-    while done < max_frames:
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            break
-
-        # 빠른 렌더: 스케일 다운
-        if scale != 1.0:
-            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
-
-        # 1) LUT
-        if lut is not None:
-            frame = apply_lut_bgr(frame, lut, "BGR" if "BGR" in lut_mode else "RGB")
-
-        # 2) 정지 그레인
-        if grain_amt > 0:
-            frame = apply_static_grain(frame, grain_amt / 10.0)
-
-        # 3) 드림 블러
-        if blur_amt > 0:
-            frame = apply_dream_blur(frame, blur_amt / 10.0)
-
-        # 4) 정지 오버레이
-        if ov_img is not None:
-            frame = apply_overlay(frame, ov_img, opacity=(overlay_op / 10.0))
-
-        # 5) 움직이는 노이즈
-        if noise_cap is not None and noise_mix > 0:
-            ok2, nframe = noise_cap.read()
-            if not ok2 or nframe is None:
-                noise_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ok2, nframe = noise_cap.read()
-            if ok2 and nframe is not None:
-                frame = blend_moving_noise(frame, nframe, amount=noise_mix / 10.0)
-
-        writer.write(frame)
-        done += 1
-        prog.progress(min(1.0, done / max_frames))
-
-        # 빠른 렌더에서 너무 긴 영상의 경우 일정 프레임만 샘플링해 속도 증가
-        if fast_mode and full_render and fps > 24:
-            # 24fps로 다운샘플(간단 프레임스키핑)
-            skip = int(max(0, round(fps / 24) - 1))
-            if skip:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, cap.get(cv2.CAP_PROP_POS_FRAMES) + skip)
-
-    writer.release()
+@st.cache_data(show_spinner=False)
+def load_noise_first_frame(path: str, max_w=480) -> np.ndarray:
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return None
+    ret, frame = cap.read()
     cap.release()
-    if noise_cap is not None:
-        noise_cap.release()
+    if not ret or frame is None:
+        return None
+    if frame.shape[1] > max_w:
+        scale = max_w / frame.shape[1]
+        frame = cv2.resize(frame, (int(frame.shape[1] * scale), int(frame.shape[0] * scale)))
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-def run_pipeline(full_render: bool):
-    if video_file is None:
-        st.warning("📁 영상을 먼저 업로드해주세요.")
-        return
-    # 임시 파일 저장
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
-        tmp_in.write(video_file.read())
-        src = tmp_in.name
-    out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+# ---------- UI ----------
+video = st.file_uploader("🎥 영상 업로드 (MP4/MOV/AVI, ≤ 200MB)", type=["mp4", "mov", "avi"])
 
-    process_video(src, out, full_render=full_render)
+@ -134,10 +160,20 @@ with col1:
+    overlay_name = st.selectbox("정지 오버레이 이미지", ["None"] + overlay_list, index=0)
+    overlay_alpha_step = st.slider("오버레이 강도 (1–10)", 1, 10, 3)
+    overlay_alpha = overlay_alpha_step / 10.0
+    # --- overlay preview ---
+    if overlay_name != "None":
+        ov_img = load_overlay_preview(os.path.join(OVERLAY_DIR, overlay_name))
+        if ov_img is not None:
+            st.image(ov_img, caption=f"Overlay: {overlay_name}", use_container_width=True)
+with col2:
+    noise_name = st.selectbox("움직이는 노이즈(비디오)", ["None"] + noise_list, index=0)
+    noise_strength_step = st.slider("노이즈 강도 (1–10)", 1, 10, 2)
+    noise_strength = noise_strength_step / 10.0
+    # --- noise thumbnail (first frame) ---
+    if noise_name != "None":
+        nf = load_noise_first_frame(os.path.join(NOISE_DIR, noise_name))
+        if nf is not None:
+            st.image(nf, caption=f"Noise preview (first frame): {noise_name}", use_container_width=True)
 
-    if full_render:
-        st.success("✅ 렌더 완료!")
-        st.video(out)  # 인앱 재생
-        st.download_button("💾 결과 다운로드", open(out, "rb").read(),
-                           file_name=f"Miromi_{Path(video_file.name).stem}.mp4",
-                           mime="video/mp4")
-    else:
-        st.success("🎬 미리보기 생성 완료 (약 3초)!")
-        st.video(out)
+st.subheader("✨ 추가 효과")
+col3, col4 = st.columns(2)
+@ -149,8 +185,8 @@ with col4:
 
-# --------------------------
-# Actions
-# --------------------------
-if btn_preview:
-    run_pipeline(full_render=False)
+st.subheader("⚡ 빠른 렌더")
+fast_mode = st.checkbox("빠른 렌더 (권장)", value=True,
+                        help="FPS를 최대 15로 제한해 전체 프레임 수를 줄여 CPU 처리량을 낮춥니다. "
+                             "해상도는 유지되며, Streamlit Cloud는 GPU가 없으므로 CPU 최적화 방식입니다.")
+                        help="FPS를 최대 15로 제한하고 프레임 샘플링으로 CPU 처리량을 낮춥니다. "
+                             "해상도는 유지. (Streamlit Cloud는 GPU 없음 → CPU 최적화)")
 
-if btn_render:
-    run_pipeline(full_render=True)
+run = st.button("🚀 필터 적용하기")
+
+@ -170,8 +206,11 @@ if run and video is not None:
+        h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+
+        # 빠른 렌더: FPS cap (최대 15)
+        # 빠른 렌더: FPS cap (최대 15) + 프레임 스킵
+        target_fps = min(15.0, fps) if fast_mode else fps
+        frame_skip = 1
+        if fast_mode and fps > 15:
+            frame_skip = int(round(fps / 15.0))  # 대략 15fps로 샘플링
+
+        out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), target_fps, (w, h))
+@ -193,11 +232,6 @@ if run and video is not None:
+        prog = st.progress(0)
+        done = 0
+
+        # 프레임 스킵 비율 (빠른 렌더 시)
+        frame_skip = 1
+        if fast_mode and fps > 15:
+            frame_skip = int(round(fps / 15.0))  # 대략 15fps로 샘플링
+
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+@ -241,10 +275,15 @@ if run and video is not None:
+            noise_cap.release()
+
+        st.success("✅ 처리 완료!")
+        st.video(out_path)
+
+        # ✅ 페이지 내 바로 재생(다운 없이) — bytes로 전달하면 안정적
+        with open(out_path, "rb") as vf:
+            video_bytes = vf.read()
+        st.video(video_bytes, format="video/mp4", start_time=0)
+
+        st.download_button(
+            "💾 결과 영상 다운로드",
+            data=open(out_path, "rb").read(),
+            data=video_bytes,
+            file_name=f"Miromi_{(lut_name if lut_name!='None' else 'NoLUT').replace('.cube','')}.mp4",
+            mime="video/mp4",
+        )
